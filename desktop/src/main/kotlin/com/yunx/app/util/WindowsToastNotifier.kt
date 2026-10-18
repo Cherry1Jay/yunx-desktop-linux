@@ -24,6 +24,12 @@ object WindowsToastNotifier {
     /** 测试/无头环境可关闭通知交互（默认开启；不影响下载本身） */
     @Volatile
     var enabled: Boolean = true
+
+    /** [Linux 移植] Linux 上没有 Windows 通知中心，改走 notify-send（同名 tag 原地替换） */
+    private val isLinux = System.getProperty("os.name").lowercase().contains("linux")
+
+    /** Linux 进度通知节流：notify-send 每次要 fork 一个进程，1s 一次太浪费 */
+    private const val LINUX_PROGRESS_THROTTLE_MS = 3000L
     private var proc: Process? = null
     private var writer: BufferedWriter? = null
     private val starting = AtomicBoolean(false)
@@ -87,6 +93,11 @@ object WindowsToastNotifier {
     @Synchronized
     fun sessionStart() {
         if (!enabled) return
+        // Linux：不走常驻子进程，进度直接用 notify-send 发（带 value 提示），无需会话
+        if (isLinux) {
+            lastUpdateTs.set(0)
+            return
+        }
         if (!isWindows) return
         if (proc?.isAlive == true) return
         if (!starting.compareAndSet(false, true)) return
@@ -127,6 +138,21 @@ object WindowsToastNotifier {
         if (!enabled) return
         lastDoneSum = doneSum
         lastTotalSum = totalSum
+        // [Linux 移植] notify-send + x-canonical-private-synchronous 实现「原地刷新」的进度通知
+        if (isLinux) {
+            val now = System.currentTimeMillis()
+            if (now - lastUpdateTs.get() < LINUX_PROGRESS_THROTTLE_MS) return
+            lastUpdateTs.set(now)
+            val pct = if (totalSum > 0) ((doneSum * 100) / totalSum).toInt().coerceIn(0, 100) else 0
+            val body = buildString {
+                append(statusLabel)
+                if (statusLine.isNotBlank()) append(" · ").append(statusLine)
+                if (speedText.isNotBlank()) append(" · ").append(speedText)
+                append(" · ").append(pct).append('%')
+            }
+            Platform.notify("云析 · $line1", body, TrayManager.notificationIcon(), progress = pct, tag = "yunx-progress")
+            return
+        }
         if (!isWindows || writer == null) return
         val now = System.currentTimeMillis()
         if (now - lastUpdateTs.get() < UPDATE_THROTTLE_MS) return
@@ -147,9 +173,19 @@ object WindowsToastNotifier {
     @Synchronized
     fun sessionEnd() {
         if (!enabled) return
-        if (!isWindows) return
         val completed = lastTotalSum > 0 && lastDoneSum >= lastTotalSum
         lastDoneSum = 0; lastTotalSum = 0
+        // [Linux 移植] 用同 tag 覆盖进度通知：完成→完成文案，未完成→收尾提示
+        if (isLinux) {
+            val icon = TrayManager.notificationIcon()
+            if (completed) {
+                Platform.notify("云析 · 下载完成", "全部任务已下载完毕", icon, progress = 100, tag = "yunx-progress")
+            } else {
+                Platform.notify("云析", "下载已暂停或部分失败", icon, tag = "yunx-progress")
+            }
+            return
+        }
+        if (!isWindows) return
         if (completed) {
             sendLine("done|${esc("云析 · 下载完成")}|${esc("全部任务已下载完毕")}")
             closeQuietly()
