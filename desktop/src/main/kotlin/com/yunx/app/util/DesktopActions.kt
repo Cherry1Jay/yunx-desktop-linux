@@ -43,6 +43,8 @@ object DesktopActions {
     fun openFile(path: String): Boolean {
         val file = File(path)
         if (!file.exists()) return false
+        // [Linux 移植] xdg-open 比 AWT Desktop 更可靠（后者依赖 gnome-url-handler 注册）
+        if (Platform.isLinux) return Platform.openWithDefaultApp(file)
         return runCatching {
             java.awt.Desktop.getDesktop().open(file)
             true
@@ -62,6 +64,8 @@ object DesktopActions {
     fun revealFile(path: String): Boolean {
         val file = File(path)
         if (!file.exists()) return false
+        // [Linux 移植] FileManager1.ShowItems（Nautilus/Dolphin/Thunar 均实现），失败回退打开父目录
+        if (Platform.isLinux) return Platform.openInFileManager(file, select = true)
         if (WindowsTitleBar.isWindows) {
             // 返回 HINSTANCE：> 32 表示成功（<= 32 是错误码），失败再退回命令行方式
             val ret = runCatching {
@@ -78,10 +82,11 @@ object DesktopActions {
         }.getOrDefault(false)
     }
 
-    /** 在资源管理器中打开目录（不存在时先创建） */
+    /** 在文件管理器中打开目录（不存在时先创建） */
     fun openDirectory(path: String): Boolean {
         val dir = File(path)
         if (!dir.isDirectory && !dir.mkdirs()) return false
+        if (Platform.isLinux) return Platform.openInFileManager(dir, select = false)
         return runCatching {
             ProcessBuilder("explorer.exe", dir.absolutePath).start()
             true
@@ -118,6 +123,17 @@ object DesktopActions {
      * 拿不到启动器 exe（开发运行 `gradle run`）时返回 false，由调用方提示手动重启。
      */
     fun restartApp(): Boolean {
+        // [Linux 移植] jpackage 的 app-image 启动器是 ELF 可执行文件，直接 exec 即可；
+        // 不能用 Windows 的 cmd+ping 延迟法，Linux 上用 sh 睡 2 秒等本进程释放数据库句柄。
+        if (Platform.isLinux) {
+            val exe = launcherExePosix() ?: return false
+            return runCatching {
+                ProcessBuilder("sh", "-c", "sleep 2; exec \"${exe.absolutePath}\"")
+                    .directory(exe.parentFile)
+                    .start()
+                true
+            }.getOrDefault(false)
+        }
         val exe = launcherExe() ?: return false
         return runCatching {
             // 用 cmd 延迟启动：本进程马上就会退出，必须等它把文件句柄都放掉。
@@ -133,18 +149,47 @@ object DesktopActions {
     /**
      * 关闭计算机（「下载完成后关机」用）。
      *
-     * 走系统 shutdown 命令：普通用户本地关机不需要管理员权限（SeShutdownPrivilege），
-     * 调用方无需提权。非 Windows 直接返回 false（本功能目前仅在桌面端 Windows 提供）。
+     * Windows 走系统 shutdown 命令：普通用户本地关机不需要管理员权限（SeShutdownPrivilege），
+     * 调用方无需提权。
+     * [Linux 移植] 走 systemctl poweroff / logind；无 systemd 的桌面回退 `shutdown -h now`。
      *
      * @param seconds 关机前延迟秒数（0 = 立即关机）；调用方负责在倒计时期间决定是否取消
      * @return 是否成功发起
      */
     fun shutdownComputer(seconds: Int = 0): Boolean {
+        if (Platform.isLinux) {
+            val delay = seconds.coerceAtLeast(0)
+            return runCatching {
+                val cmd = if (delay > 0) {
+                    listOf("sh", "-c", "sleep $delay && systemctl poweroff --no-block 2>/dev/null || shutdown -h now")
+                } else if (Platform.commandExists("systemctl")) {
+                    listOf("systemctl", "poweroff", "--no-block")
+                } else {
+                    listOf("sh", "-c", "shutdown -h now")
+                }
+                ProcessBuilder(cmd).start()
+                true
+            }.getOrDefault(false)
+        }
         if (!WindowsTitleBar.isWindows) return false
         return runCatching {
             ProcessBuilder("shutdown", "/s", "/t", seconds.coerceAtLeast(0).toString()).start()
             true
         }.getOrDefault(false)
+    }
+
+    /**
+     * [Linux 移植] 找到可执行自身的启动器：优先 jpackage 注入的路径，
+     * 其次安装位置（/opt/yunx-desktop/bin/YunX-Desktop，由 PKGBUILD 决定）。
+     */
+    private fun launcherExePosix(): File? {
+        System.getProperty("jpackage.app-path")?.let { p ->
+            File(p).takeIf { it.isFile }?.let { return it }
+        }
+        return listOf(
+            "/opt/yunx-desktop/bin/YunX-Desktop",
+            "/usr/lib/yunx-desktop/bin/YunX-Desktop"
+        ).map(::File).firstOrNull { it.isFile }
     }
 
     /** 便携版/安装版的启动器 exe：优先 jpackage 注入的路径，否则取工作目录下的 YunX-Desktop.exe */
