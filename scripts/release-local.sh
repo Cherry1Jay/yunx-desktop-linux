@@ -175,7 +175,9 @@ fi
 for f in dist/*; do
     name=$(basename "$f")
     log "上传 $name"
-    curl -sS --max-time 600 "${AUTH[@]}" \
+    # 实测：230MB 经代理上行约 5 分钟（~780KB/s）。原来给 600s 只有 1.3 倍余量，
+    # 网络抖动一下就白跑一整轮构建，这里放宽到 30 分钟。
+    curl -sS --max-time 1800 "${AUTH[@]}" \
         -H "Content-Type: application/octet-stream" \
         --data-binary "@$f" \
         "https://uploads.github.com/repos/${REPO_SLUG}/releases/${RELEASE_ID}/assets?name=${name}" \

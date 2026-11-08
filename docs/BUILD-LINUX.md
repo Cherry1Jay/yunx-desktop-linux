@@ -129,6 +129,58 @@ export GH_TOKEN=<你的 token>
 ./scripts/release-local.sh --build-only   # 只出包到 dist/
 ```
 
+### 定时自动构建（systemd timer，Actions 不可用时的等价方案）
+
+`~/yunx-desktop-linux` 这个符号链接指向仓库，按下面的方式挂到用户级 systemd：
+
+```bash
+mkdir -p ~/.config/yunx-release ~/.local/state
+install -m 600 /dev/null ~/.config/yunx-release/token
+printf '%s\n' '<你的 token>' > ~/.config/yunx-release/token   # 只存 token，不写进单元文件
+```
+
+`~/.config/systemd/user/yunx-upstream-sync.service` + `.timer`：
+
+```ini
+# .service
+[Service]
+Type=oneshot
+WorkingDirectory=%h/yunx-desktop-linux
+ExecStart=%h/yunx-desktop-linux/scripts/release-local.sh --sync
+TimeoutStartSec=3h
+Nice=10
+Environment=JAVA_HOME=/usr/lib/jvm/java-17-openjdk
+Environment=GRADLE_USER_HOME=%h/.cache/wb-yunx/gradle-home
+Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+StandardOutput=append:%h/.local/state/yunx-upstream-sync.log
+StandardError=append:%h/.local/state/yunx-upstream-sync.log
+
+# .timer
+[Timer]
+OnCalendar=*-*-* 04:00:00
+Persistent=true            # 桌面机关了机，开机补跑
+RandomizedDelaySec=15min   # 别在开机瞬间抢 CPU
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now yunx-upstream-sync.timer
+systemctl --user start yunx-upstream-sync.service   # 立刻跑一次
+journalctl --user -u yunx-upstream-sync -f
+tail -f ~/.local/state/yunx-upstream-sync.log
+```
+
+定时运行比 CI 多几道保护，都在 `scripts/release-local.sh` 里：
+
+| 保护 | 原因 |
+| --- | --- |
+| 进入 `--sync` 先 `git rebase --abort` 残留中间态 | 上一轮被打断会留下 detached HEAD，下一轮直接崩 |
+| 工作区有未提交改动 → 放弃并退出 | 定时任务不能替人做决定、更不该动用户手上的编辑 |
+| 不在 `main` 分支 → 拒绝 rebase | 防止在临时分支上把移植层改乱 |
+| rebase 冲突 → 自动回滚到干净状态 | 不留半成品等人工 |
+| 发布前先 `git push HEAD:main` | Release 的 `target_commitish` 必须已存在于远程，否则 422 |
+| `dist/` 只留最近两组产物 | 每次约 460MB，根分区撑不住 |
+
 ## 七、许可
 
 源码以 AGPL-3.0 发布，构建与分发同样受其约束（须提供对应源码、保留协议与修改声明）。

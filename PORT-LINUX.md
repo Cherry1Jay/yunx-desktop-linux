@@ -182,3 +182,61 @@ else             implementation(files("libs/sqlite-jdbc-3.47.1.0-win.jar"))
 - **HLS 转 MP4**、资源分类与图片/视频预览、B 站专属页与清晰度选择
 - **下载完成后关机**（Linux 已补实现）、存储迁移、退出稳定性修复
 - 顶部轻提示替代底部 Snackbar；断点续传时弹性分片不再重叠
+
+## 八、2026-11-08 补充：自动构建落地到本机 systemd
+
+GitHub Actions 走不通（账号 Billing 被锁，任何 workflow 都是 3 秒失败、`steps: 0`，
+注解原文 `The job was not started because your account is locked due to a billing issue.`），
+改为本机 systemd user timer 每天 04:00 跑同一套 `scripts/release-local.sh --sync`。
+
+单元在 `~/.config/systemd/user/yunx-upstream-sync.{service,timer}`，日志
+`~/.local/state/yunx-upstream-sync.log`，token 单独放 `~/.config/yunx-release/token`（600）。
+详细配置见 [docs/BUILD-LINUX.md](docs/BUILD-LINUX.md)。
+
+### 这轮踩到的两个坑
+
+**1. 定时任务被自己的「工作区脏」检查拦下**
+
+第一次 `systemctl --user start` 直接失败：
+
+```
+ERROR: 工作区有未提交改动，放弃同步（定时任务不应改动用户手上的编辑）
+```
+
+检查本身是对的（定时任务不该替人做决定），但当时工作区脏是因为刚在改脚本，属于预期。提交后重跑正常。
+
+**2. 创建 Release 报 422，报错信息完全误导**
+
+```
+{"message":"Validation Failed","errors":[
+  {"field":"tag_name","message":"tag_name is not a valid tag"},
+  {"field":"target_commitish","code":"invalid"}]}
+```
+
+看着像 tag 名字非法或 token 权限不足，实际原因是**这个 commit 还没 push**——
+Release 的 `target_commitish` 指向远程不存在的 commit，GitHub 连带把 tag 也判成非法。
+
+修法：发布前先 `git push HEAD:main`；同时把服务端的原始响应打出来（原来只有一句
+「检查 GH_TOKEN 权限是否含 repo」，白跑一轮构建）。验证方式：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -H "Authorization: token $TOKEN" \
+  https://api.github.com/repos/Cherry1Jay/yunx-desktop-linux/commits/$(git rev-parse HEAD)
+# 422 = 远程没有这个 commit，就是它
+```
+
+### 定时跑起来后的保护清单
+
+| 保护 | 场景 |
+| --- | --- |
+| `--sync` 前先 `rebase --abort` | 上一轮被中断留下 detached HEAD，下一轮会直接崩 |
+| 工作区脏 / 不在 main → 退出 | 不替人做决定，不碰未提交的编辑 |
+| rebase 冲突 → 自动回滚 | 不留半成品，日志里给出手工命令 |
+| 先 push 再发 Release | 避开上面那个 422 |
+| `dist/` 只留两组产物 | 每次 460MB，根分区只有 18G 可用 |
+
+### 实测结果
+
+一次完整流程：编译 10s（Gradle 缓存命中）→ makepkg 打包约 1 分钟 →
+`git push` → 创建 Release `v1.3.3-linux.1` → 上传 `pkg.tar.zst`（228MB，HTTP 201）。
