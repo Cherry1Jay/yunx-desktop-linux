@@ -102,6 +102,25 @@ class SettingsRepository {
             prefs.putBoolean("notification_show_speed", value)
         }
 
+    /**
+     * [Linux 移植] 下载通知模式 —— Linux 没有 Windows 通知中心，桌面通知走 notify-send。
+     *
+     * 取值见 [NOTIFY_MODE_*]：
+     * - `off`：完全不发通知；
+     * - `done`（默认）：只在全部任务下载完成时发一条，中途不打扰；
+     * - `live`：实时进度条（用 freedesktop `replaces_id` 原地替换同一条通知）。
+     *
+     * 之所以默认 `done`：`x-canonical-private-synchronous` 这类私有 hint 只有 Unity/notify-osd
+     * 认，GNOME Shell / KDE 一律忽略，于是旧实现每 3 秒就会新开一条通知把桌面刷满。
+     * 现改为真正按 XDG 规范的 `replaces_id`，并在此模式下探测是否被服务端接受（不接受自动降级）。
+     */
+    var downloadNotifyMode: String
+        get() = prefs.get("download_notify_mode", NOTIFY_MODE_DONE)
+            .takeIf { it in NOTIFY_MODES } ?: NOTIFY_MODE_DONE
+        set(value) {
+            prefs.put("download_notify_mode", value.takeIf { it in NOTIFY_MODES } ?: NOTIFY_MODE_DONE)
+        }
+
     /** 夸克取链方式：true=免转存（直接换下载直链，不写入网盘，默认）；false=先转存到临时目录再取链 */
     var quarkNoSaveDownload: Boolean
         get() = prefs.getBoolean("quark_no_save_download", true)
@@ -574,6 +593,15 @@ class SettingsRepository {
     }
 
     companion object {
+        /** [Linux 移植] 下载通知：不发 */
+        const val NOTIFY_MODE_OFF = "off"
+        /** [Linux 移植] 下载通知：仅全部完成时发一条（默认） */
+        const val NOTIFY_MODE_DONE = "done"
+        /** [Linux 移植] 下载通知：实时进度（replaces_id 原地刷新） */
+        const val NOTIFY_MODE_LIVE = "live"
+        /** [Linux 移植] 下载通知模式的合法取值 */
+        val NOTIFY_MODES = setOf(NOTIFY_MODE_OFF, NOTIFY_MODE_DONE, NOTIFY_MODE_LIVE)
+
         /** 关闭行为：每次询问 */
         const val CLOSE_BEHAVIOR_ASK = "ask"
         /** 关闭行为：直接退出 */

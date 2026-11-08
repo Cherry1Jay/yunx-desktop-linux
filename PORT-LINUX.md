@@ -1,11 +1,12 @@
 # YunX-Desktop Linux 移植记录
 
-- **日期**：2026-10-18
-- **上游**：`tidain/YunX-Desktop` v1.2.9（Windows 桌面移植版，AGPL-3.0）
-- **发布仓库**：`FairyJJ/yunx-desktop-linux`（<https://github.com/FairyJJ/yunx-desktop-linux>，tag `v1.2.9-linux.1`）
+- **初始移植**：2026-10-18（基于上游 v1.2.9）
+- **本次升级**：2026-11-08（移植层重放到上游 v1.3.3 + 11-04 的两个热修）
+- **上游**：`tidain/YunX-Desktop` v1.3.3（Windows 桌面移植版，AGPL-3.0）
+- **发布仓库**：`Cherry1Jay/yunx-desktop-linux`（<https://github.com/Cherry1Jay/yunx-desktop-linux>，tag `v1.3.3-linux.1`）
 - **目标机**：EndeavourOS / Arch 系，GNOME Wayland，x86_64
 - **工作副本**：`/home/jay/WorkBuddy/2026-10-17-08-56-35/yunx-linux`
-- **安装包**：`~/.cache/wb-pkgs/yunx-desktop-1.2.9-1-x86_64.pkg.tar.zst`（258 M）
+- **安装包**：`packaging/yunx-desktop-1.3.3-1-x86_64.pkg.tar.zst`（228 M）
 
 ## 一、为什么不是「从安卓移植」
 
@@ -77,7 +78,7 @@ java -classpath gradle/wrapper/gradle-wrapper.jar \
 cd packaging && makepkg -f
 
 # 3) 安装
-sudo pacman -U yunx-desktop-1.2.9-1-x86_64.pkg.tar.zst
+sudo pacman -U yunx-desktop-1.3.3-1-x86_64.pkg.tar.zst
 
 # 4) 启动
 yunx-desktop          # 或应用列表里搜「云析」
@@ -112,3 +113,72 @@ rm -rf ~/.yunx-desktop          # 连账号与任务一起清
    `by tasks.registering(...)` 推断不出共同类型，要显式 `TaskProvider<out Task>`。
 4. **jcef 原生库版本号必须与 jcefmaven 严格一致**，否则运行期 JCEF 初始化报 API 不匹配。
 5. **app-image 里 lib 目录 331 M**：绝大部分是 JCEF 原生库，打包后 zst 压缩到 258 M，属正常。
+
+## 七、2026-11-08 升级到上游 v1.3.3
+
+### 升级方式：移植层 rebase，而不是重新移植
+
+本仓库的提交结构是「上游全部历史 + 叠加在其上的 3 个 Linux 移植提交」，所以升级就是把移植层重放到新基线：
+
+```bash
+git fetch upstream
+git rebase --onto upstream/main $(cat PORT-BASE)
+```
+
+`.github/workflows/upstream-sync.yml` 每天自动做这件事：上游有更新 → rebase → 编译 → 发 Release；
+冲突则开 Issue 等人工处理（不静默吞掉上游改动）。上游基线 commit 记在仓库根目录 `PORT-BASE`。
+
+### 本次 rebase 的 4 处冲突与处理
+
+| 文件 | 冲突原因 | 处理 |
+| --- | --- | --- |
+| `desktop/build.gradle.kts` | 上游给 jcefmaven 加了 `exclude(jogl/gluegen)` 并把原生库写死 `windows-amd64` | 保留上游的体积优化，同时保留移植层的 `jcefNativesPlatform()` 按平台选原生库 |
+| `desktop/build.gradle.kts` (nativeDistributions) | 上游 `targetFormats(TargetFormat.Exe)`；移植层按宿主平台选 | 用移植层的平台判断，`modules()` 保留上游新增的 `jdk.httpserver`、`jdk.unsupported.desktop`（漏了视频预览会全挂） |
+| `Main.kt` | 上游托盘右键改回 Win32 原生菜单；移植层用通用 `menuItems` | 用移植层的通用菜单（Linux 无 Win32），最小化逻辑保留上游新增的 `saveWindowPosition` |
+| `DesktopActions.kt` | 上游新增「下载完成后关机」`shutdownComputer`；移植层新增 `launcherExePosix` | 两者都保留，`shutdownComputer` 补 Linux 实现（`systemctl poweroff --no-block`，回退 `shutdown -h now`） |
+| `WindowsToastNotifier.kt` | 上游新增 `enabled` 开关 | 与移植层的 Linux 分支合并（见下节） |
+
+`README.md` 冲突直接取移植版（Linux 用户看的话术与上游不同），随后手工补上版本号与新特性说明。
+
+### 升级后暴露的两个真问题
+
+**1. `UnsatisfiedLinkError: NativeDB._open_utf8`** —— 1.3.x 上游把 `sqlite-jdbc` 换成了自己裁剪过的
+本地 jar `libs/sqlite-jdbc-3.47.1.0-win.jar`（只留 `org/sqlite/native/Windows/*`，省 11 MB）。
+Linux 上加载不到 `libsqlitejdbc.so`，打开数据库即崩。修法：按平台分支依赖，Linux 走 Maven 完整包：
+
+```kotlin
+if (hostIsLinux) implementation("org.xerial:sqlite-jdbc:3.47.1.0")
+else             implementation(files("libs/sqlite-jdbc-3.47.1.0-win.jar"))
+```
+
+> 这类「上游为 Windows 裁剪资源」的坑在后续每次升级都可能出现，rebase 后**必须先跑一遍启动冒烟**。
+
+**2. 下载通知刷屏（用户反馈的核心问题）**
+
+旧实现想用 `x-canonical-private-synchronous:<tag>` 让通知「原地刷新」，但这是 Unity / notify-osd 的私有
+扩展，**GNOME Shell 与 KDE 都不认**，直接当未知 hint 丢弃 ⇒ 每 3 秒一条新通知，下载大文件时桌面被刷爆。
+
+实测证据（GNOME 51 / notify-send 0.8.9）：
+
+```
+旧实现，连发 3 次 → id=1551, 1552, 1553   ← 每次都新建
+新实现，-r 1550 替换 → id=1550            ← 原地刷新
+```
+
+修法：
+- `Platform.notifyWithId()` 加 `-p/--print-id` 拿 id、`-r/--replace-id` 替换；
+- 首次替换若返回的 id ≠ 传入的 id（说明服务端忽略了替换参数），立刻判定不支持并**永久降级**，
+  不会退回刷屏行为；
+- 新增设置 `download_notify_mode`：`done`（默认，只在全部完成时弹一条）/ `live`（实时进度）/ `off`（静默）；
+- 会话未完成（暂停/失败）时用 `CloseNotification` 静默收掉进度条，不额外弹提示。
+
+对应代码：`Platform.kt`（`notifyWithId` / `closeNotification`）、`WindowsToastNotifier.kt`（`linuxSendProgress`）、
+`SettingsRepository.kt`（`downloadNotifyMode`）、`SettingsScreen.kt`（三档选择弹窗）。
+
+### 顺带获得的上游新能力（1.2.9 → 1.3.3）
+
+- **P2P 下载**：磁力 / BT 种子 / ed2k，含 Tracker 管理与「启动位置」选择
+- **浏览器插件桥接**：嗅探 + 劫持下载 + 弹窗询问目录/线程数 + 归还浏览器下载
+- **HLS 转 MP4**、资源分类与图片/视频预览、B 站专属页与清晰度选择
+- **下载完成后关机**（Linux 已补实现）、存储迁移、退出稳定性修复
+- 顶部轻提示替代底部 Snackbar；断点续传时弹性分片不再重叠

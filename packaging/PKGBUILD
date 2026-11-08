@@ -1,6 +1,6 @@
-# Maintainer: FairyJJ <https://github.com/FairyJJ>
+# Maintainer: Cherry1Jay <https://github.com/Cherry1Jay>
 # 云析 YunX-Desktop 的 Linux 移植版（自建包，非 AUR 官方）
-# 上游：tidain/YunX-Desktop（AGPL-3.0）→ 本仓库 FairyJJ/yunx-desktop-linux
+# 上游：tidain/YunX-Desktop（AGPL-3.0）→ 本仓库 Cherry1Jay/yunx-desktop-linux
 # 许可证：AGPL-3.0，分发时须提供对应源码并保留协议与修改声明（见 ../NOTICE）
 #
 # 说明：本 PKGBUILD 不重新编译 Kotlin（需要 Gradle + 网络拉依赖，不适合放进 makepkg 的
@@ -11,11 +11,15 @@
 #   APPIMAGE=<app-image 绝对路径> makepkg -f
 #
 pkgname=yunx-desktop
-pkgver=1.2.9
+# 版本号单一来源：仓库根目录 version.txt 第一行（与上游同步，跟随上游升级自动变化）
+# 用 BASH_SOURCE 定位 PKGBUILD 所在目录，再取上一级的 version.txt
+_pkgdir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+pkgver=$(awk 'NR==1{print $1}' "$_pkgdir/../version.txt" 2>/dev/null)
+pkgver=${pkgver:-0}
 pkgrel=1
 pkgdesc="云析 YunX 桌面版（Linux 移植）：网盘分享链接解析与高速下载"
 arch=('x86_64')
-url="https://github.com/FairyJJ/yunx-desktop-linux"
+url="https://github.com/Cherry1Jay/yunx-desktop-linux"
 license=('AGPL-3.0')
 depends=('gtk3' 'libxtst' 'libxrender' 'fontconfig' 'freetype2' 'nss' 'alsa-lib' 'libxkbcommon' 'libdrm' 'mesa')
 optdepends=(

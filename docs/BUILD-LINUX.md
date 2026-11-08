@@ -25,7 +25,7 @@ sudo pacman -S --needed jdk17-openjdk
 ## 二、构建命令
 
 ```bash
-git clone https://github.com/FairyJJ/yunx-desktop-linux.git
+git clone https://github.com/Cherry1Jay/yunx-desktop-linux.git
 cd yunx-desktop-linux
 
 export JAVA_HOME=/usr/lib/jvm/java-17-openjdk
@@ -40,7 +40,7 @@ export PATH="$JAVA_HOME/bin:$PATH"
 # 2) 打 pacman 包（可选）
 cd packaging
 makepkg -f
-sudo pacman -U yunx-desktop-1.2.9-1-x86_64.pkg.tar.zst
+sudo pacman -U yunx-desktop-1.3.3-1-x86_64.pkg.tar.zst
 ```
 
 `PKGBUILD` 不重新编译 Kotlin（避免把 Gradle 网络依赖塞进 makepkg 的离线环境），

@@ -384,6 +384,25 @@ private fun windowExceptionFactory(
 }.getOrNull()
 
 /**
+ * 从系统托盘恢复主窗口：显示并切到前台。
+ * Windows 下 toFront() 单独调用不可靠，需配合 isAlwaysOnTop 瞬时切换。
+ * [Linux 移植] 部分 Wayland 合成器不支持 isAlwaysOnTop 的有效期语义，但调用无害。
+ */
+private fun showMainWindowFromTray(window: java.awt.Frame?) {
+    val w = window ?: return
+    w.isVisible = true
+    // 从最小化状态恢复（最小化到任务栏时 extendedState 含 ICONIFIED 位）
+    if (w.extendedState and java.awt.Frame.ICONIFIED != 0) {
+        w.extendedState = java.awt.Frame.NORMAL
+    }
+    val wasOnTop = w.isAlwaysOnTop
+    w.isAlwaysOnTop = true
+    w.toFront()
+    w.requestFocus()
+    w.isAlwaysOnTop = wasOnTop
+}
+
+/**
  * 从 classpath 读取 icon.png 构建窗口图标（标题栏 / 任务栏）；
  * 失败返回 null（使用默认图标）。
  */
