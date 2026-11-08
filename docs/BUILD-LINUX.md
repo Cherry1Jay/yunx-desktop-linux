@@ -89,7 +89,47 @@ export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus
 | 下载时提示没有可用内核 | 首次使用会从 GitHub 拉 `gopeed-web-<ver>-linux-amd64.zip`；网络受限时先在设置里配代理/镜像 |
 | `./gradlew` 没有执行权限 | `chmod +x gradlew` |
 
-## 六、许可
+## 六、跟随上游升级
+
+本仓库的提交结构是「上游 `tidain/YunX-Desktop` 的全部历史 + 叠加在其上的 Linux 移植提交」，
+所以升级 = 把移植层重放到上游新基线上，**不需要重新移植**：
+
+```bash
+git fetch upstream
+git rebase --onto upstream/main $(cat PORT-BASE)   # PORT-BASE 记录上次的上游基线 commit
+echo <新上游 sha> > PORT-BASE
+git add PORT-BASE && git commit -m "构建基线：跟随上游"
+```
+
+### 自动化（GitHub Actions）
+
+`.github/workflows/upstream-sync.yml` 每天 04:00（北京时间）跑一次：
+
+| 阶段 | 行为 |
+| --- | --- |
+| 检测 | 比较 `upstream/main` 与 `PORT-BASE`，无变化则直接结束 |
+| 重放 | `git rebase --onto` 移植层；**冲突不静默吞**（不用 `-X ours`），开 Issue 附本地处理命令 |
+| 编译 | JDK 17 编译 `:desktop:createDistributable` |
+| 打包 | pacman 包 + 通用 tar.gz |
+| 发布 | 打 tag `v<应用版本>-linux.<序号>`，发 Release |
+| 失败 | 开 Issue 并附运行日志链接 |
+
+也能在 Actions 页面手动触发：`force` 可强制重建当前版本，`upstream_ref` 可指定上游 tag。
+
+> ⚠️ Actions 依赖账号 Billing 状态。若运行记录显示
+> 「The job was not started because your account is locked due to a billing issue」，
+> 说明账号被账单问题锁定，需先到 <https://github.com/settings/billing> 处理。
+
+### 本地兜底（不依赖 Actions）
+
+```bash
+export GH_TOKEN=<你的 token>
+./scripts/release-local.sh            # 构建 + 发布
+./scripts/release-local.sh --sync     # 先 rebase 上游最新，再构建发布
+./scripts/release-local.sh --build-only   # 只出包到 dist/
+```
+
+## 七、许可
 
 源码以 AGPL-3.0 发布，构建与分发同样受其约束（须提供对应源码、保留协议与修改声明）。
 详见根目录 [LICENSE](../LICENSE) 与 [NOTICE](../NOTICE)。

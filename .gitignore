@@ -66,3 +66,5 @@ release-assets/
 packaging/pkg/
 packaging/src/
 packaging/*.pkg.tar.zst
+# 本机构建/发布脚本的产物目录（scripts/release-local.sh）
+dist/
