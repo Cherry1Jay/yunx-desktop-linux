@@ -140,6 +140,16 @@ if [ -z "${GH_TOKEN:-}" ] && [ -r "$HOME/.config/yunx-release/token" ]; then
 fi
 [ -n "${GH_TOKEN:-}" ] || die "发布需要 GH_TOKEN（环境变量，或 ~/.config/yunx-release/token；--build-only 可跳过发布）"
 
+# Release 的 target_commitish 必须已经存在于远程，否则 GitHub 返回 422，而且报错是
+# "tag_name is not a valid tag" + "target_commitish invalid" —— 看着像 tag 名字非法或
+# token 权限不够，实际原因是这个 commit 还没 push。先推再发。
+PUSH_URL="https://x-access-token:${GH_TOKEN}@github.com/${REPO_SLUG}.git"
+log "推送 main 到远程"
+if ! PUSH_OUT=$(git -c credential.helper= push "$PUSH_URL" HEAD:main 2>&1); then
+    printf '%s\n' "${PUSH_OUT//$GH_TOKEN/***}" >&2
+    die "推送 main 失败（远程可能有他人提交，先 git fetch 看看）"
+fi
+
 N=$(git tag -l "v${APPVER}-linux.*" | wc -l)
 TAG="v${APPVER}-linux.$((N + 1))"
 log "发布 tag = $TAG"
@@ -147,12 +157,20 @@ log "发布 tag = $TAG"
 API="https://api.github.com/repos/${REPO_SLUG}"
 AUTH=(-H "Authorization: token ${GH_TOKEN}" -H "Accept: application/vnd.github+json")
 
-RELEASE_ID=$(curl -sS --max-time 30 "${AUTH[@]}" -X POST "$API/releases" \
+RELEASE_RESP=$(curl -sS --max-time 30 -w '\n%{http_code}' "${AUTH[@]}" -X POST "$API/releases" \
     -d "$(printf '{"tag_name":"%s","target_commitish":"%s","name":"云析 Linux 移植 %s（%s）","body":"本机构建发布，基于上游 %s"}' \
-        "$TAG" "$(git rev-parse HEAD)" "$APPVER" "$TAG" "$(tr -d '[:space:]' < PORT-BASE | cut -c1-8)")" \
-    | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("id") or "")')
+        "$TAG" "$(git rev-parse HEAD)" "$APPVER" "$TAG" "$(tr -d '[:space:]' < PORT-BASE | cut -c1-8)")")
+RELEASE_CODE=${RELEASE_RESP##*$'\n'}
+RELEASE_BODY=${RELEASE_RESP%$'\n'*}
+RELEASE_ID=$(printf '%s' "$RELEASE_BODY" | python3 -c 'import sys,json
+try: print(json.load(sys.stdin).get("id") or "")
+except Exception: print("")')
 
-[ -n "$RELEASE_ID" ] || die "创建 Release 失败（检查 GH_TOKEN 权限是否含 repo）"
+if [ -z "$RELEASE_ID" ]; then
+    echo "HTTP $RELEASE_CODE" >&2
+    printf '%s\n' "$RELEASE_BODY" >&2
+    die "创建 Release 失败（上面是服务端原始响应）"
+fi
 
 for f in dist/*; do
     name=$(basename "$f")
