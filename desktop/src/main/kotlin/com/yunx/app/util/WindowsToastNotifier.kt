@@ -2,9 +2,11 @@ package com.yunx.app.util
 
 import com.sun.jna.platform.win32.Advapi32Util
 import com.sun.jna.platform.win32.WinReg
+import com.yunx.app.data.prefs.SettingsRepository
 import java.io.BufferedWriter
 import java.io.File
 import java.io.OutputStreamWriter
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -14,7 +16,17 @@ import java.util.concurrent.atomic.AtomicLong
  * - 常驻 PowerShell 子进程持有 WinRT ToastNotificationManager，Kotlin 通过 stdin 逐行喂进度；
  * - AUMID 注册在 HKCU\Software\Classes\AppUserModelId\YunX.Desktop（通知显示「云析」与应用图标）；
  * - 同 tag/group 重发会原地替换 Action Center 里的既有 toast（进度条原地刷新，不刷屏）。
- * 非 Windows 平台全部 no-op。
+ *
+ * [Linux 移植] Linux 走 freedesktop 桌面通知（notify-send），行为由设置项
+ * [SettingsRepository.downloadNotifyMode] 控制：
+ * - `done`（默认）只发「全部下载完成」一条，中途完全不打扰；
+ * - `live` 用 `replaces_id` 原地刷新同一条进度通知；
+ * - `off` 全静默。
+ *
+ * ★ 历史 bug：早先实现用 `x-canonical-private-synchronous` 这个私有 hint 做「原地替换」，
+ *   但只有 Unity / notify-osd 认它，GNOME Shell 与 KDE 都当未知 hint 丢掉 —— 结果每 3 秒
+ *   就新开一条通知，下载大文件时桌面被刷满。现改用规范里的 `replaces_id`，并在首次替换时
+ *   校验服务端返回的 id 是否与传入的一致；不一致就判定不支持并自动降级为 `done`。
  */
 object WindowsToastNotifier {
     private const val AUMID = "YunX.Desktop"
@@ -25,11 +37,32 @@ object WindowsToastNotifier {
     @Volatile
     var enabled: Boolean = true
 
-    /** [Linux 移植] Linux 上没有 Windows 通知中心，改走 notify-send（同名 tag 原地替换） */
+    /** [Linux 移植] Linux 上没有 Windows 通知中心，改走 notify-send */
     private val isLinux = System.getProperty("os.name").lowercase().contains("linux")
 
     /** Linux 进度通知节流：notify-send 每次要 fork 一个进程，1s 一次太浪费 */
     private const val LINUX_PROGRESS_THROTTLE_MS = 3000L
+
+    /** Linux：当前进度通知的 id（用于 `replaces_id` 原地刷新；null 表示还没有在途通知） */
+    @Volatile private var linuxNotifyId: Int? = null
+
+    /**
+     * Linux：服务端是否真的接受 `replaces_id`。
+     * 首次替换时若返回的 id 与传入的不一致（说明服务端忽略了替换参数、另开了一条），
+     * 置为 false 并永久降级 —— 宁可不显示进度，也不能把桌面刷满。
+     */
+    @Volatile private var linuxReplaceSupported = true
+
+    /**
+     * Linux 通知串行执行器：notify-send 要 fork 进程并读 stdout，
+     * 不能在下载回调线程上阻塞，也不能并发发（并发会打乱 id 的先后顺序）。
+     */
+    private val linuxNotifyExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "yunx-linux-notify").apply { isDaemon = true }
+    }
+
+    private val settings: SettingsRepository by lazy { SettingsRepository() }
+
     private var proc: Process? = null
     private var writer: BufferedWriter? = null
     private val starting = AtomicBoolean(false)
@@ -96,6 +129,7 @@ object WindowsToastNotifier {
         // Linux：不走常驻子进程，进度直接用 notify-send 发（带 value 提示），无需会话
         if (isLinux) {
             lastUpdateTs.set(0)
+            linuxNotifyId = null
             return
         }
         if (!isWindows) return
@@ -138,8 +172,11 @@ object WindowsToastNotifier {
         if (!enabled) return
         lastDoneSum = doneSum
         lastTotalSum = totalSum
-        // [Linux 移植] notify-send + x-canonical-private-synchronous 实现「原地刷新」的进度通知
+        // [Linux 移植] 桌面通知：模式由设置决定（off / done / live），只有 live 才刷进度
         if (isLinux) {
+            if (settings.downloadNotifyMode != SettingsRepository.NOTIFY_MODE_LIVE) return
+            // 服务端证明不支持 replaces_id 后永久停发进度（避免又变成每 3 秒一条）
+            if (!linuxReplaceSupported) return
             val now = System.currentTimeMillis()
             if (now - lastUpdateTs.get() < LINUX_PROGRESS_THROTTLE_MS) return
             lastUpdateTs.set(now)
@@ -150,7 +187,7 @@ object WindowsToastNotifier {
                 if (speedText.isNotBlank()) append(" · ").append(speedText)
                 append(" · ").append(pct).append('%')
             }
-            Platform.notify("云析 · $line1", body, TrayManager.notificationIcon(), progress = pct, tag = "yunx-progress")
+            linuxSendProgress("云析 · $line1", body, pct)
             return
         }
         if (!isWindows || writer == null) return
@@ -175,13 +212,28 @@ object WindowsToastNotifier {
         if (!enabled) return
         val completed = lastTotalSum > 0 && lastDoneSum >= lastTotalSum
         lastDoneSum = 0; lastTotalSum = 0
-        // [Linux 移植] 用同 tag 覆盖进度通知：完成→完成文案，未完成→收尾提示
+        // [Linux 移植] 会话结束：完成→一条完成通知（原地覆盖在途进度条）；未完成→静默收掉进度条
         if (isLinux) {
-            val icon = TrayManager.notificationIcon()
+            val mode = settings.downloadNotifyMode
+            val prevId = linuxNotifyId
+            linuxNotifyId = null
+            if (mode == SettingsRepository.NOTIFY_MODE_OFF) return
             if (completed) {
-                Platform.notify("云析 · 下载完成", "全部任务已下载完毕", icon, progress = 100, tag = "yunx-progress")
-            } else {
-                Platform.notify("云析", "下载已暂停或部分失败", icon, tag = "yunx-progress")
+                val icon = TrayManager.notificationIcon()
+                // 完成通知用较长驻留时间，用户不在电脑前也能看到
+                linuxNotifyExecutor.execute {
+                    Platform.notifyWithId(
+                        "云析 · 下载完成",
+                        "全部任务已下载完毕",
+                        icon,
+                        progress = 100,
+                        replaceId = prevId,
+                        timeoutMs = 15_000
+                    )
+                }
+            } else if (prevId != null) {
+                // 暂停 / 部分失败：不额外弹窗，把进度通知收掉即可
+                linuxNotifyExecutor.execute { Platform.closeNotification(prevId) }
             }
             return
         }
@@ -192,6 +244,34 @@ object WindowsToastNotifier {
         } else {
             sendLine("exit")
             closeQuietly()
+        }
+    }
+
+    /**
+     * [Linux 移植] 发送或刷新一条进度通知。
+     *
+     * 首次（[linuxNotifyId] 为空）新建并记下服务端返回的 id；之后带 `replaces_id` 原地刷新，
+     * 同一条通知原地更新进度，不产生新横幅。
+     *
+     * 若服务端返回的 id 与传入的不一致，说明它忽略了 `replaces_id`（另开了一条）——
+     * 此时立刻关掉刚弹出的那条、把 [linuxReplaceSupported] 置 false，之后不再发进度，
+     * 避免退回「每 3 秒刷一条」的旧行为。
+     */
+    private fun linuxSendProgress(title: String, body: String, pct: Int) {
+        val prevId = linuxNotifyId
+        linuxNotifyExecutor.execute {
+            val (id, replaced) = Platform.notifyWithId(
+                title, body, TrayManager.notificationIcon(),
+                progress = pct, replaceId = prevId, timeoutMs = 8000
+            )
+            if (prevId != null && !replaced) {
+                linuxReplaceSupported = false
+                linuxNotifyId = null
+                if (id != null) Platform.closeNotification(id)
+                Log.w(TAG, "notify-send 未接受 replaces_id（返回 id=$id，期望 $prevId），已降级为仅完成通知")
+            } else {
+                linuxNotifyId = id
+            }
         }
     }
 

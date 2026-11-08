@@ -13,7 +13,7 @@
 [![Kotlin](https://img.shields.io/badge/Kotlin-7F52FF?style=flat-square&logo=kotlin&logoColor=white)](https://kotlinlang.org/)
 [![Compose](https://img.shields.io/badge/Compose%20Multiplatform-Desktop-4285F4?style=flat-square&logo=jetpackcompose&logoColor=white)](https://www.jetbrains.com/lp/compose-multiplatform/)
 
-[下载最新版](https://github.com/FairyJJ/yunx-desktop-linux/releases/latest) · [安装](#安装) · [Linux 平台实现](#linux-平台实现) · [已知限制](#已知限制) · [从源码构建](docs/BUILD-LINUX.md) · [改动清单](PORT-LINUX.md)
+[下载最新版](https://github.com/Cherry1Jay/yunx-desktop-linux/releases/latest) · [安装](#安装) · [Linux 平台实现](#linux-平台实现) · [已知限制](#已知限制) · [从源码构建](docs/BUILD-LINUX.md) · [改动清单](PORT-LINUX.md)
 
 </div>
 
@@ -22,8 +22,8 @@
 > ### 这是非官方的 Linux 移植版
 >
 > - **上游（安卓）**：[CYQawa/YunX](https://github.com/CYQawa/YunX)
-> - **上游（Windows 桌面）**：[tidain/YunX-Desktop](https://github.com/tidain/YunX-Desktop) v1.2.9 —— 本项目的直接基座
-> - **本仓库**：`FairyJJ/yunx-desktop-linux`，2026-10-18 起由 FairyJJ 修改，**仅新增/修改 Linux 平台相关代码**，业务逻辑未改动
+> - **上游（Windows 桌面）**：[tidain/YunX-Desktop](https://github.com/tidain/YunX-Desktop) v1.3.3 —— 本项目的直接基座
+> - **本仓库**：`Cherry1Jay/yunx-desktop-linux`，2026-10-18 起由 FairyJJ 修改，**仅新增/修改 Linux 平台相关代码**，业务逻辑未改动
 >
 > 上游作者不提供 Linux 支持，Linux 相关问题请提到**本仓库** Issues，不要去打扰上游。
 > 完整的修改清单见 **[PORT-LINUX.md](PORT-LINUX.md)**，第三方组件与版权归属见 **[NOTICE](NOTICE)**。
@@ -46,7 +46,7 @@
 
 ```bash
 # 从 Releases 下载后
-sudo pacman -U yunx-desktop-1.2.9-1-x86_64.pkg.tar.zst
+sudo pacman -U yunx-desktop-1.3.3-1-x86_64.pkg.tar.zst
 yunx-desktop        # 或应用菜单搜「云析」
 ```
 
@@ -56,7 +56,7 @@ yunx-desktop        # 或应用菜单搜「云析」
 ### 其他发行版（便携包）
 
 ```bash
-tar -xzf YunX-Desktop-1.2.9-linux-x86_64.tar.gz
+tar -xzf yunx-desktop-1.3.3-linux-x86_64.tar.gz
 ./YunX-Desktop/bin/YunX-Desktop
 ```
 
@@ -79,7 +79,7 @@ tar -xzf YunX-Desktop-1.2.9-linux-x86_64.tar.gz
 | 能力     | 上游（Windows）                    | 本仓库（Linux）                                                                                      |
 | ------ | ------------------------------- | ----------------------------------------------------------------------------------------------- |
 | 托盘右键菜单 | JNA `TrackPopupMenuEx`          | AWT `PopupMenu`                                                                                 |
-| 桌面通知   | PowerShell + WinRT toast        | `notify-send`（`x-canonical-private-synchronous` 原地刷新 + `int:value` 进度）                          |
+| 桌面通知   | PowerShell + WinRT toast        | `notify-send` + freedesktop `replaces_id` 原地刷新（默认仅完成时通知一条，可在设置切换）                        |
 | 下载防休眠  | `SetThreadExecutionState`       | `systemd-inhibit --what=idle:sleep`                                                             |
 | 定位文件   | `explorer.exe /select,`         | `org.freedesktop.FileManager1.ShowItems` → 回退 `xdg-open`                                       |
 | 打开文件/目录 | `explorer.exe`                  | `xdg-open`                                                                                      |
@@ -92,6 +92,23 @@ tar -xzf YunX-Desktop-1.2.9-linux-x86_64.tar.gz
 | 下载内核   | `gopeed-web-<ver>-windows-amd64` | `gopeed-web-<ver>-linux-amd64.zip`，解包后补执行位                                                    |
 
 数据目录：`~/.yunx-desktop/`（`yunx.db`、`credential.key`、日志、JCEF 缓存）。
+
+### 下载通知（重点）
+
+> **旧版本 bug**：1.2.x 用 `x-canonical-private-synchronous` 这个私有 hint 想让进度通知「原地刷新」，
+> 但**只有 Unity / notify-osd 认它**，GNOME Shell 和 KDE 都当未知 hint 丢弃 —— 结果每 3 秒新开一条
+> 通知，下载大文件时桌面会被通知刷满。
+>
+> **1.3.3 起已修**：改用 freedesktop 规范里的 `replaces_id`（`notify-send -r <id>`），同一条通知原地更新；
+> 并在首次替换时校验服务端返回的 id 是否与传入一致，不一致就判定不支持、自动降级，绝不会再刷屏。
+
+「设置 → 下载通知」三档：
+
+| 档位 | 行为 |
+| --- | --- |
+| **仅全部完成时**（默认） | 下载过程中完全不弹，全部任务完成后弹一条 |
+| 实时进度条 | 同一条通知原地刷新进度（GNOME / KDE / Dunst / mako 均支持）；不支持则自动降级为上一档 |
+| 关闭通知 | 任何下载通知都不发 |
 
 ## 已知限制
 

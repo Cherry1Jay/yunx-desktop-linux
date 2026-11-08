@@ -65,8 +65,9 @@ object Platform {
      * 发送桌面通知（仅 Linux 实现，其他平台返回 false 由调用方回退）。
      *
      * 走 `notify-send`：Ubuntu/GNOME/KDE 默认都装了 libnotify-bin。
-     * @param progress 0..100，带进度提示（GNOME Shell / KDE 会渲染成进度条）
-     * @param tag 同步标签：同 tag 的通知会原地替换，用于进度刷新不刷屏
+     * @param progress 0..100，带进度提示（KDE 会渲染成进度条；GNOME 只显示数字文本）
+     * @param tag 同步标签：**只有 Unity / notify-osd 认**这个私有 hint，GNOME Shell 与 KDE 会
+     *   当作未知 hint 忽略 —— 不要再用它做「原地替换」，需要替换请用 [notifyWithId]。
      */
     fun notify(
         title: String,
@@ -82,6 +83,70 @@ object Platform {
         progress?.let { cmd += listOf("-h", "int:value:${it.coerceIn(0, 100)}") }
         cmd += listOf(title, body)
         return execDetached(*cmd.toTypedArray())
+    }
+
+    /**
+     * [Linux 移植] 发送通知并**返回通知 id**，支持按 XDG 规范原地替换。
+     *
+     * 与 [notify] 的区别：
+     * - 加 `-p/--print-id` 拿服务端分配的 id；
+     * - [replaceId] 非空时加 `-r/--replace-id`，服务端若支持 `replaces_id`（GNOME Shell、
+     *   KDE Plasma、Dunst、mako 都支持）就会**原地更新同一条通知**，不产生新横幅；
+     * - 同步读取 stdout（最长 2s），因此**不要在 UI 线程调用**。
+     *
+     * 返回值里的 `replaced` 用于判断服务端是否真的接受了替换：按规范，`replaces_id`
+     * 命中已存在的通知时 `Notify` 必须返回**同一个 id**。返回了新 id 说明服务端忽略了
+     * 替换参数（会另开一条），调用方应据此降级，避免又把桌面刷满。
+     *
+     * @return (通知 id, 是否成功原地替换)；失败时 id 为 null
+     */
+    fun notifyWithId(
+        title: String,
+        body: String,
+        iconPath: File? = null,
+        progress: Int? = null,
+        replaceId: Int? = null,
+        timeoutMs: Int = 5000
+    ): Pair<Int?, Boolean> {
+        if (!isLinux) return null to false
+        val cmd = mutableListOf("notify-send", "-a", "云析", "-p", "-t", timeoutMs.toString())
+        iconPath?.takeIf { it.isFile }?.let { cmd += listOf("-i", it.absolutePath) }
+        replaceId?.let { cmd += listOf("-r", it.toString()) }
+        progress?.let { cmd += listOf("-h", "int:value:${it.coerceIn(0, 100)}") }
+        cmd += listOf(title, body)
+        return runCatching {
+            val p = ProcessBuilder(cmd)
+                .redirectError(ProcessBuilder.Redirect.DISCARD)
+                .start()
+            val id = p.inputStream.bufferedReader().use { r ->
+                r.readLine()?.trim()?.toIntOrNull()
+            }
+            if (!p.waitFor(2, TimeUnit.SECONDS)) p.destroyForcibly()
+            val replaced = replaceId != null && id != null && id == replaceId
+            id to replaced
+        }.getOrDefault(null to false)
+    }
+
+    /** [Linux 移植] 关闭一条已存在的通知（下载会话未完成时收掉进度条用） */
+    fun closeNotification(id: Int): Boolean {
+        if (!isLinux) return false
+        val ok = execDetached(
+            "gdbus", "call", "--session",
+            "--dest", "org.freedesktop.Notifications",
+            "--object-path", "/org/freedesktop/Notifications",
+            "--method", "org.freedesktop.Notifications.CloseNotification",
+            id.toString()
+        )
+        if (ok) return true
+        // 没有 gdbus 的极简环境回退 dbus-send
+        return execDetached(
+            "dbus-send", "--session",
+            "--dest=org.freedesktop.Notifications",
+            "--type=method_call",
+            "/org/freedesktop/Notifications",
+            "org.freedesktop.Notifications.CloseNotification",
+            "uint32:$id"
+        )
     }
 
     /**

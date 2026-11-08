@@ -43,7 +43,14 @@ dependencies {
     // Room -> 纯 JDBC SQLite
     // ★ 用裁剪后的本地 jar：官方包 13.6 MB，含六个平台的原生库，本项目只跑 Windows。
     //   只保留 org/sqlite/native/Windows（x86/x86_64/arm/arm64），其余代码与 META-INF 原样保留。
-    implementation(files("libs/sqlite-jdbc-3.47.1.0-win.jar"))
+    // [Linux 移植] ★ 上面那个裁剪包**只有 Windows 的 .so/.dll**：Linux 上直接用它会在打开数据库时抛
+    //   UnsatisfiedLinkError: NativeDB._open_utf8（jar 里找不到 native/Linux/x86_64/libsqlitejdbc.so）。
+    //   所以 Linux 改回 Maven 上的完整包（含全平台原生库），版本必须与裁剪包一致。
+    if (hostIsLinux) {
+        implementation("org.xerial:sqlite-jdbc:3.47.1.0")
+    } else {
+        implementation(files("libs/sqlite-jdbc-3.47.1.0-win.jar"))
+    }
     // Android 内置 org.json 的 JVM 等价物
     implementation("org.json:json:20240303")
     // 主题种子色（material-color-utilities 无公开仓库坐标；从 material 1.14.0 AAR 解包 classes.jar 本地引入）

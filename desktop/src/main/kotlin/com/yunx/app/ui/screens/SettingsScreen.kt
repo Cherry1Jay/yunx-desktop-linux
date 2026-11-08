@@ -91,6 +91,7 @@ import com.yunx.app.util.DesktopActions
 import com.yunx.app.util.DiagnosticLog
 import com.yunx.app.util.Log
 import com.yunx.app.util.LogExporter
+import com.yunx.app.util.Platform
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -223,6 +224,9 @@ fun SettingsScreen(
     // 用户体验与系统适配：下载时阻止休眠 / 通知中心进度
     var keepAwake by remember { mutableStateOf(settingsRepo.keepAwakeWhileDownloading) }
     var showSpeed by remember { mutableStateOf(settingsRepo.notificationShowSpeed) }
+    // [Linux 移植] 下载通知三档：关闭 / 仅完成 / 实时进度
+    var notifyMode by remember { mutableStateOf(settingsRepo.downloadNotifyMode) }
+    var showNotifyModeDialog by remember { mutableStateOf(false) }
     var clipboardDetect by remember { mutableStateOf(settingsRepo.clipboardLinkDetection) }
     // 关闭主窗口时的行为：ask / exit / tray
     var closeBehavior by remember { mutableStateOf(settingsRepo.closeBehavior) }
@@ -317,16 +321,31 @@ fun SettingsScreen(
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        SettingsItem(
-            icon = Icons.Outlined.Notifications,
-            title = "通知中心下载进度",
-            description = if (showSpeed) "Windows 通知中心进度条 + 下载速度" else "Windows 通知中心仅显示进度条（隐藏速度）",
-            onClick = {
-                showSpeed = !showSpeed
-                settingsRepo.notificationShowSpeed = showSpeed
-            },
-            trailing = { Switch(checked = showSpeed, onCheckedChange = null) }
-        )
+        if (Platform.isLinux) {
+            // [Linux 移植] Linux 没有 Windows 通知中心：桌面通知走 notify-send，
+            // 且不同 DE 对「原地刷新进度条」的支持差异极大，所以做成三档显式选择。
+            SettingsItem(
+                icon = Icons.Outlined.Notifications,
+                title = "下载通知",
+                description = when (notifyMode) {
+                    SettingsRepository.NOTIFY_MODE_OFF -> "不发送任何桌面通知"
+                    SettingsRepository.NOTIFY_MODE_LIVE -> "实时进度：同一条通知原地刷新（不受支持的桌面会自动降级）"
+                    else -> "仅全部下载完成时弹一条，下载过程中不打扰（推荐）"
+                },
+                onClick = { showNotifyModeDialog = true }
+            )
+        } else {
+            SettingsItem(
+                icon = Icons.Outlined.Notifications,
+                title = "通知中心下载进度",
+                description = if (showSpeed) "Windows 通知中心进度条 + 下载速度" else "Windows 通知中心仅显示进度条（隐藏速度）",
+                onClick = {
+                    showSpeed = !showSpeed
+                    settingsRepo.notificationShowSpeed = showSpeed
+                },
+                trailing = { Switch(checked = showSpeed, onCheckedChange = null) }
+            )
+        }
 
         Spacer(modifier = Modifier.height(8.dp))
 
@@ -1152,6 +1171,49 @@ fun SettingsScreen(
         },
         confirmButton = {
             TextButton(onClick = { showRetryDialog = false }) { Text("取消") }
+        }
+    )
+
+    // [Linux 移植] 下载通知模式选择（关闭 / 仅完成 / 实时进度）
+    FadeAlertDialog(
+        visible = showNotifyModeDialog,
+        onDismissRequest = { showNotifyModeDialog = false },
+        title = { Text("下载通知") },
+        text = {
+            val options = listOf(
+                SettingsRepository.NOTIFY_MODE_DONE to "仅全部完成时（推荐）",
+                SettingsRepository.NOTIFY_MODE_LIVE to "实时进度条",
+                SettingsRepository.NOTIFY_MODE_OFF to "关闭通知"
+            )
+            Column {
+                options.forEach { (value, label) ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        RadioButton(
+                            selected = notifyMode == value,
+                            onClick = {
+                                notifyMode = value
+                                settingsRepo.downloadNotifyMode = value
+                                showNotifyModeDialog = false
+                            }
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(label, style = MaterialTheme.typography.bodyMedium)
+                    }
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "「实时进度条」会在同一条通知上原地刷新（freedesktop replaces_id）；" +
+                        "若当前桌面不支持，会自动降级为「仅全部完成时」，不会刷屏。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { showNotifyModeDialog = false }) { Text("取消") }
         }
     )
 
