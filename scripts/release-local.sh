@@ -38,6 +38,18 @@ die() { printf '\033[31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
 # ---------- 1. 可选：跟随上游 ----------
 if [ "$SYNC" = 1 ]; then
+    # 定时任务里最怕留下半截 rebase：下次一进来就是 detached HEAD + 冲突文件。
+    # 宁可这一轮放弃，也不要把仓库留在中间态。
+    if [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; then
+        log "检测到上次遗留的 rebase 中间态，先回滚到干净状态"
+        git rebase --abort || die "无法 abort 上次的 rebase，请手工处理 .git/rebase-* 后重试"
+    fi
+    if [ -n "$(git status --porcelain)" ]; then
+        die "工作区有未提交改动，放弃同步（定时任务不应改动用户手上的编辑）"
+    fi
+    BRANCH=$(git rev-parse --abbrev-ref HEAD)
+    [ "$BRANCH" = "main" ] || die "当前不在 main 分支（当前：$BRANCH），拒绝自动 rebase"
+
     log "同步上游"
     git remote get-url upstream >/dev/null 2>&1 || git remote add upstream "$UPSTREAM_URL"
     git fetch upstream '+refs/heads/*:refs/remotes/upstream/*'
@@ -51,7 +63,11 @@ if [ "$SYNC" = 1 ]; then
     else
         if ! git rebase --onto "$NEW_SHA" "$OLD_SHA"; then
             echo
-            die "rebase 冲突。解决后执行：git add -A && git rebase --continue && echo $NEW_SHA > PORT-BASE && git add PORT-BASE && git commit -m '构建基线'"
+            git rebase --abort >/dev/null 2>&1 || true
+            die "rebase 冲突（已回滚，仓库保持原状）。请手工执行：
+  git rebase --onto $NEW_SHA $OLD_SHA
+  # 解冲突 → git add -A && git rebase --continue
+  echo $NEW_SHA > PORT-BASE && git add PORT-BASE && git commit -m '构建基线：跟随上游'"
         fi
         echo "$NEW_SHA" > PORT-BASE
         git add PORT-BASE
@@ -68,6 +84,11 @@ command -v java >/dev/null || die "找不到 java，请装 jdk17-openjdk"
 JAVA_MAJOR=$(java -version 2>&1 | sed -n 's/.*version "\([0-9]*\).*/\1/p')
 [ "${JAVA_MAJOR:-0}" -ge 17 ] || die "需要 JDK 17+，当前是 $JAVA_MAJOR"
 
+# 定时任务是非交互环境，没有 shell profile；显式给 GRADLE_USER_HOME 才能复用
+# 已有的依赖缓存（含 130MB 的 CEF 原生库），否则每次都重新下载。
+if [ -z "${GRADLE_USER_HOME:-}" ] && [ -d "$HOME/.cache/wb-yunx/gradle-home" ]; then
+    export GRADLE_USER_HOME="$HOME/.cache/wb-yunx/gradle-home"
+fi
 log "编译 app-image（首次约 3-10 分钟）"
 ./gradlew :desktop:createDistributable --console=plain
 
@@ -94,6 +115,18 @@ python3 - "$MAKEPKG_BUILDDIR" <<'PYEOF'
 import shutil, sys
 shutil.rmtree(sys.argv[1], ignore_errors=True)
 PYEOF
+# 只留最近两组产物（每组 = tar.gz + pkg.tar.zst，约 460MB）。
+# 桌面机根分区本来就吃紧，定时任务跑上几个月不能让它慢慢堆满。
+python3 - "$ROOT/dist" <<'PYEOF'
+import os, sys
+d = sys.argv[1]
+files = [os.path.join(d, f) for f in os.listdir(d)
+         if f.endswith(('.tar.gz', '.pkg.tar.zst'))]
+files.sort(key=os.path.getmtime, reverse=True)
+for f in files[4:]:
+    os.unlink(f)
+    print("  清理旧产物:", os.path.basename(f))
+PYEOF
 ls -lh dist
 
 if [ "$BUILD_ONLY" = 1 ]; then
@@ -102,7 +135,10 @@ if [ "$BUILD_ONLY" = 1 ]; then
 fi
 
 # ---------- 4. 发布 ----------
-[ -n "${GH_TOKEN:-}" ] || die "发布需要 GH_TOKEN 环境变量（--build-only 可跳过发布）"
+if [ -z "${GH_TOKEN:-}" ] && [ -r "$HOME/.config/yunx-release/token" ]; then
+    GH_TOKEN=$(tr -d '[:space:]' < "$HOME/.config/yunx-release/token")
+fi
+[ -n "${GH_TOKEN:-}" ] || die "发布需要 GH_TOKEN（环境变量，或 ~/.config/yunx-release/token；--build-only 可跳过发布）"
 
 N=$(git tag -l "v${APPVER}-linux.*" | wc -l)
 TAG="v${APPVER}-linux.$((N + 1))"
