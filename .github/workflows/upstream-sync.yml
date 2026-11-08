@@ -1,0 +1,292 @@
+name: 跟随上游自动构建
+
+# 本仓库 = 上游 tidain/YunX-Desktop 的历史 + 叠加在其上的 Linux 移植提交。
+# 这个 workflow 每天检查上游有没有新提交，有就自动把移植层 rebase 到新基线上，
+# 编译 Linux 包并发布 Release。rebase 出现业务冲突时**不会瞎猜**，而是开 Issue 等人处理。
+#
+# 版本号规则：
+#   - 应用版本取自 version.txt 第一行（上游维护）
+#   - 发布 tag = v<应用版本>-linux.<序号>，序号按同版本已发布数量递增
+#   - 上游基线 commit 记录在仓库根目录的 PORT-BASE 里
+
+on:
+  schedule:
+    # 每天 20:00 UTC = 北京时间 04:00，避开白天用网高峰
+    - cron: '0 20 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '强制重新构建（即使上游没有新提交）'
+        type: boolean
+        default: false
+      upstream_ref:
+        description: '指定上游 ref（留空 = upstream/main；可填 tag，如 v1.3.3）'
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: tidain/YunX-Desktop
+
+jobs:
+  sync-and-build:
+    name: 同步上游并构建
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+      options: --user root
+    steps:
+      # ---------- 环境准备 ----------
+      - name: 安装构建依赖
+        run: |
+          set -euo pipefail
+          # 容器里的 archlinux-keyring 通常比仓库旧，先单独升级它，否则 -Syu 会因签名失败
+          pacman -Sy --noconfirm --needed archlinux-keyring >/dev/null
+          pacman -Su --noconfirm >/dev/null
+          pacman -S --noconfirm --needed \
+            git jdk17-openjdk base-devel unzip zip tar zstd \
+            gawk which findutils sed grep coreutils >/dev/null
+          java -version
+          git --version
+
+      - name: 准备非 root 构建用户（makepkg 拒绝 root 身份）
+        run: |
+          set -euo pipefail
+          useradd -m builder
+          mkdir -p /home/builder/.gradle
+          chown -R builder:builder /home/builder
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 缓存 Gradle 依赖（含 130MB 的 CEF 原生库）
+        uses: actions/cache@v4
+        with:
+          path: /home/builder/.gradle
+          key: gradle-${{ hashFiles('**/*.gradle.kts', 'gradle/wrapper/gradle-wrapper.properties', 'gradle/libs.versions.toml') }}
+          restore-keys: gradle-
+
+      - name: 修正工作目录属主
+        run: |
+          set -euo pipefail
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          # 缓存恢复出来的文件属主是 root，builder 无法写入，必须一并交还
+          chown -R builder:builder /home/builder/.gradle || true
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # ---------- 判断上游是否有更新 ----------
+      - name: 检查上游更新
+        id: check
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || true
+          git fetch upstream '+refs/heads/*:refs/remotes/upstream/*' '+refs/tags/*:refs/tags/upstream/*'
+
+          TARGET="${{ inputs.upstream_ref }}"
+          if [ -z "$TARGET" ]; then TARGET=upstream/main; fi
+          NEW_SHA=$(git rev-parse "$TARGET")
+          OLD_SHA=$(tr -d '[:space:]' < PORT-BASE 2>/dev/null || echo "")
+
+          echo "上游目标 : $TARGET -> $NEW_SHA"
+          echo "当前基线 : ${OLD_SHA:-<无>}"
+          echo "new_sha=$NEW_SHA" >> "$GITHUB_OUTPUT"
+          echo "old_sha=$OLD_SHA" >> "$GITHUB_OUTPUT"
+
+          if [ "$NEW_SHA" = "$OLD_SHA" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "上游无新提交，本次跳过构建"
+            echo "need_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "need_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ---------- 把移植层搬到新基线 ----------
+      - name: 重放 Linux 移植层到新基线
+        id: rebase
+        if: steps.check.outputs.need_build == 'true'
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -uo pipefail
+          NEW_SHA="${{ steps.check.outputs.new_sha }}"
+          OLD_SHA="${{ steps.check.outputs.old_sha }}"
+
+          if [ -z "$OLD_SHA" ]; then
+            echo "PORT-BASE 缺失，退化为 merge 上游"
+            if ! git merge --no-edit "$NEW_SHA"; then
+              echo "failed=1" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+          else
+            # 注意：这里**故意不用** -X ours/theirs —— 冲突必须暴露，静默吞掉上游改动更危险
+            if ! git rebase --onto "$NEW_SHA" "$OLD_SHA"; then
+              echo "::warning::rebase 出现冲突，需要人工处理"
+              git rebase --abort || true
+              echo "failed=1" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          echo "$NEW_SHA" > PORT-BASE
+          git add PORT-BASE
+          git commit -m "构建基线：跟随上游 ${NEW_SHA:0:8}" --no-verify || true
+          echo "failed=0" >> "$GITHUB_OUTPUT"
+
+      - name: rebase 冲突 → 开 Issue 告警
+        if: steps.rebase.outputs.failed == '1'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const sha = '${{ steps.check.outputs.new_sha }}';
+            const title = `上游 ${sha.slice(0,8)} 需要手工 rebase`;
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', labels: 'upstream-sync'
+            });
+            if (open.some(i => i.title === title)) { core.info('已存在同类 Issue，跳过'); return; }
+            const body = [
+              `上游 [tidain/YunX-Desktop](https://github.com/tidain/YunX-Desktop) 有新提交 \`${sha}\`，`,
+              '自动 rebase Linux 移植层时发生冲突，本次未构建。',
+              '',
+              '本地处理：',
+              '```bash',
+              'git fetch upstream',
+              'git rebase --onto ' + sha + ' $(cat PORT-BASE)',
+              '# 逐个解决冲突后',
+              'git add -A && git rebase --continue',
+              'echo ' + sha + ' > PORT-BASE',
+              'git add PORT-BASE && git commit -m "构建基线：跟随上游"',
+              'git push --force-with-lease origin main',
+              '```',
+              '',
+              '推送后下次运行会自动构建并发布。'
+            ].join('\n');
+            await github.rest.issues.create({
+              owner: context.repo.owner, repo: context.repo.repo, title, body,
+              labels: ['upstream-sync']
+            });
+
+      - name: 构建失败 → 开 Issue 告警
+        if: failure() && steps.check.outputs.need_build == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const sha = '${{ steps.check.outputs.new_sha }}'.slice(0, 8);
+            const title = `上游 ${sha} 构建失败`;
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', labels: 'upstream-sync'
+            });
+            if (open.some(i => i.title === title)) return;
+            await github.rest.issues.create({
+              owner: context.repo.owner, repo: context.repo.repo, title,
+              labels: ['upstream-sync'],
+              body: `跟随上游 \`${sha}\` 的构建失败，详见 [运行日志](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})。`
+            });
+
+      # ---------- 编译 ----------
+      - name: 编译 app-image
+        if: steps.rebase.outputs.failed == '0'
+        run: |
+          set -euo pipefail
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          su builder -s /bin/bash -c "cd '$GITHUB_WORKSPACE' && GRADLE_USER_HOME=/home/builder/.gradle ./gradlew :desktop:createDistributable --console=plain --no-daemon"
+          du -sh desktop/build/compose/binaries/main/app/YunX-Desktop
+
+      - name: 计算发布版本号
+        id: ver
+        if: steps.rebase.outputs.failed == '0'
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          APPVER=$(head -1 version.txt | tr -d '[:space:]')
+          N=$(git tag -l "v${APPVER}-linux.*" | wc -l)
+          N=$((N + 1))
+          echo "appver=$APPVER" >> "$GITHUB_OUTPUT"
+          echo "tag=v${APPVER}-linux.${N}" >> "$GITHUB_OUTPUT"
+          echo "发布 tag = v${APPVER}-linux.${N}"
+
+      - name: 打包（pacman 包 + 通用 tar.gz）
+        if: steps.rebase.outputs.failed == '0'
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          APPVER="${{ steps.ver.outputs.appver }}"
+          APP="desktop/build/compose/binaries/main/app/YunX-Desktop"
+          mkdir -p dist
+
+          # 1) 通用 tar.gz：解压即用（自带精简 JRE，不依赖系统 JDK）
+          tar -C "$(dirname "$APP")" -czf "dist/yunx-desktop-${APPVER}-linux-x86_64.tar.gz" YunX-Desktop
+
+          # 2) Arch / EndeavourOS 的 pacman 包（PKGBUILD 自己从 version.txt 取 pkgver）
+          chown -R builder:builder .
+          su builder -s /bin/bash -c "cd '$GITHUB_WORKSPACE/packaging' && APPIMAGE='$GITHUB_WORKSPACE/$APP' makepkg -f --noconfirm --nodeps"
+          cp packaging/*.pkg.tar.zst dist/
+
+          ls -lh dist
+
+      # ---------- 发布 ----------
+      - name: 推送基线到 main
+        if: steps.rebase.outputs.failed == '0'
+        working-directory: ${{ github.workspace }}
+        run: git push --force-with-lease origin HEAD:main
+
+      - name: 发布 Release
+        if: steps.rebase.outputs.failed == '0'
+        working-directory: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.ver.outputs.tag }}"
+          APPVER="${{ steps.ver.outputs.appver }}"
+          USHA="${{ steps.check.outputs.new_sha }}"
+          USHORT=$(printf '%s' "$USHA" | cut -c1-8)
+          NOW=$(date -u '+%Y-%m-%d %H:%M UTC')
+          PkgVer=$(ls packaging/*.pkg.tar.zst | head -1 | xargs -n1 basename)
+
+          cat > /tmp/notes.md <<EOF
+          自动构建：跟随上游 [tidain/YunX-Desktop](https://github.com/tidain/YunX-Desktop) 的提交 \`${USHORT}\`。
+
+          - 应用版本：\`${APPVER}\`
+          - 构建时间：${NOW}
+          - 平台：Linux x86_64
+
+          ## 安装
+
+          **Arch / EndeavourOS（推荐）**
+          \`\`\`bash
+          sudo pacman -U ${PkgVer}
+          \`\`\`
+
+          **任意发行版（免安装，解压即用）**
+          \`\`\`bash
+          mkdir -p ~/.local/opt && tar -xzf yunx-desktop-${APPVER}-linux-x86_64.tar.gz -C ~/.local/opt
+          ~/.local/opt/YunX-Desktop/bin/YunX-Desktop
+          \`\`\`
+
+          本包由 Linux 移植层在最新上游代码上自动重放后编译，业务逻辑与上游一致；仅平台集成层（托盘、通知、文件管理器、防休眠、打包）为 Linux 实现。
+          EOF
+
+          gh release create "$TAG" dist/* \
+            --title "云析 Linux 移植 ${APPVER}（${TAG}）" \
+            --notes-file /tmp/notes.md \
+            --repo "${{ github.repository }}"
+
+      - name: 产物留档
+        if: always() && steps.rebase.outputs.failed == '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: yunx-desktop-${{ steps.ver.outputs.tag || 'build' }}
+          path: dist/*
+          if-no-files-found: ignore
+          retention-days: 14
